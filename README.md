@@ -119,7 +119,7 @@ llm-evaluation/
 │   ├── loader.py       # Robust JSON parser & matcher
 │   └── metrics.py      # Local NLP models (MiniLM + NLI)
 │
-├── dashboard.py        # Streamlit UI entry point
+├── dashboard.py/main.py        # Streamlit UI entry point
 ├── requirements.txt    # Python dependencies
 └── README.md           # Project documentation
 ```
