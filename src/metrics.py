@@ -1,60 +1,70 @@
-import time
-import torch
+"""Local NLP-based evaluation metrics for LLM responses.
+
+Uses:
+- ``all-MiniLM-L6-v2`` (Bi-Encoder) for semantic relevance scoring.
+- ``cross-encoder/nli-distilroberta-base`` (NLI Cross-Encoder) for
+  faithfulness / hallucination detection.
+"""
+
+from __future__ import annotations
+
+import logging
+
 import numpy as np
+import torch
 from sentence_transformers import CrossEncoder, SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 
+logger = logging.getLogger(__name__)
+
+# Model identifiers — centralised so they're easy to swap or configure
+_RELEVANCE_MODEL = "all-MiniLM-L6-v2"
+_NLI_MODEL = "cross-encoder/nli-distilroberta-base"
+
+# Maximum character length of context fed to the NLI model.  Longer contexts
+# are truncated for speed and to stay within model limits.
+_NLI_CONTEXT_MAX_CHARS = 1000
+
+
 class LLMEvaluator:
-    def __init__(self):
-        # Auto-detect hardware (Use GPU if available, else CPU)
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"Initializing Local Models on: {self.device}...")
-        
-        # 1. Relevance Model (Bi-Encoder)
-        # Fast, lightweight model for Semantic Similarity
-        self.embed_model = SentenceTransformer('all-MiniLM-L6-v2', device=self.device)
-        
-        # 2. Hallucination Model (Cross-Encoder / NLI)
-        # Predicts if Context 'Entails' (Supports) the Response
-        self.nli_model = CrossEncoder('cross-encoder/nli-distilroberta-base', device=self.device)
+    """Compute relevance and faithfulness scores using local NLP models."""
+
+    def __init__(self, device: str | None = None) -> None:
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        logger.info("Initializing Local Models on: %s", self.device)
+
+        self.embed_model = SentenceTransformer(_RELEVANCE_MODEL, device=self.device)
+        self.nli_model = CrossEncoder(_NLI_MODEL, device=self.device)
 
     def calc_relevance(self, query: str, response: str) -> float:
-        """
-        Calculates how semantically similar the response is to the query.
-        Returns: 0.0 to 1.0
-        """
+        """Semantic similarity between *query* and *response* (0.0–1.0)."""
+        if not query or not response:
+            return 0.0
+
         embeddings = self.embed_model.encode([query, response])
-        # Cosine similarity
         score = cosine_similarity([embeddings[0]], [embeddings[1]])[0][0]
-        return float(max(0.0, min(1.0, score)))
+        return float(np.clip(score, 0.0, 1.0))
 
     def calc_faithfulness(self, context: str, response: str) -> float:
-        """
-        Checks if the Response is grounded in the Context.
-        Returns: 0.0 (Hallucination) to 1.0 (Faithful)
+        """Check if *response* is grounded in *context* (0.0–1.0).
+
+        Uses NLI to measure contradiction.  Returns ``1 - P(contradiction)``.
         """
         if not context or not response:
             return 0.0
-        
-        # Prepare pair for NLI model. Truncate context to 512 chars for speed/safety.
-        # In a full prod system, we would chunk this intelligently.
-        input_pair = [(context[:1000], response)]
-        
-        # Predict logits [Contradiction, Entailment, Neutral]
+
+        # Truncate context to stay within model limits
+        input_pair = [(context[:_NLI_CONTEXT_MAX_CHARS], response)]
+
+        # Predict logits: [Contradiction, Entailment, Neutral]
         scores = self.nli_model.predict(input_pair)
-        
-        # Convert logits to probabilities using Softmax
+
         probs = self._softmax(scores[0])
-        
-        # For 'nli-distilroberta-base', index 1 is usually 'Entailment'
-        # We sum Entailment (1) and Neutral (2) as "Not Contradictory"
-        # Index 0 is Contradiction.
         contradiction_score = probs[0]
-        faithfulness_score = 1.0 - contradiction_score
-        
-        return float(faithfulness_score)
+        return float(1.0 - contradiction_score)
 
     @staticmethod
-    def _softmax(x):
+    def _softmax(x: np.ndarray) -> np.ndarray:
+        """Numerically-stable softmax."""
         e_x = np.exp(x - np.max(x))
         return e_x / e_x.sum()
